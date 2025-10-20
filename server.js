@@ -28,7 +28,7 @@ if (!apiKey) {
 console.log("✅ 7. Google API key found.");
 
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
+const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
 console.log("✅ 8. AI Model selected.");
 
 // --- NEW SUPABASE SETUP ---
