@@ -1,202 +1,109 @@
 // --- Imports ---
 require('dotenv').config();
-console.log("✅ 1. 'dotenv' loaded.");
-
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-console.log("✅ 2. Google AI package loaded.");
-
-const axios = require('axios');
-console.log("✅ 3. 'axios' package loaded.");
-
-const cheerio = require('cheerio');
-console.log("✅ 4. 'cheerio' package loaded.");
-
+// REMOVE axios and cheerio - no longer needed!
 const express = require('express');
 const cors = require('cors');
-console.log("✅ 5. Express and CORS loaded.");
-
-// --- NEW SUPABASE IMPORT ---
 const { createClient } = require('@supabase/supabase-js');
-console.log("✅ 6. Supabase client loaded.");
 
-// --- AI Setup ---
+// --- Setup (AI, Supabase) ---
 const apiKey = process.env.GOOGLE_API_KEY;
-if (!apiKey) {
-  console.error("❌ FATAL ERROR: GOOGLE_API_KEY is not found in your .env file!");
-  process.exit(1); 
-}
-console.log("✅ 7. Google API key found.");
-
+if (!apiKey) { console.error("❌ FATAL ERROR: GOOGLE_API_KEY missing!"); process.exit(1); }
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
-console.log("✅ 8. AI Model selected.");
+// --- Use the model that worked best for you (1.0-pro recommended for accuracy) ---
+const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+console.log("Using AI Model:", "gemini-1.0-pro");
 
-// --- NEW SUPABASE SETUP ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-  console.error("❌ FATAL ERROR: SUPABASE_URL or SUPABASE_SERVICE_KEY is not found in your .env file!");
-  process.exit(1);
-}
-
-// Initialize the Supabase admin client
+if (!supabaseUrl || !supabaseKey) { console.error("❌ FATAL ERROR: Supabase config missing!"); process.exit(1); }
 const supabase = createClient(supabaseUrl, supabaseKey);
-console.log("✅ 9. Supabase client initialized.");
 
 // --- Server Setup ---
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000; // Use Render's port or default to 3000
 app.use(cors());
-console.log("✅ 10. Express server configured.");
+app.use(express.json()); // <-- ***** ADD THIS LINE ***** Middleware to parse JSON
 
-// --- Updated Scraper Function ---
-async function getPageContent(url) {
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        // --- Use a more modern User-Agent ---
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9', // Tell server we prefer English
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' // Standard accept header
-      },
-      timeout: 4000 // Add a timeout (e.g., 4 seconds) to prevent hanging on slow sites
-    });
-
-    // Simple check if the response looks like HTML
-    const contentType = response.headers['content-type'];
-    if (!contentType || !contentType.includes('html')) {
-        console.warn(`Warning: Response from ${url} is not HTML (${contentType}). Falling back to URL-only.`);
-        return { title: url, description: '' };
-    }
-
-    const $ = cheerio.load(response.data);
-
-    // --- Try Open Graph tags first, then fall back to standard tags ---
-    let title = $('meta[property="og:title"]').attr('content') || $('title').text();
-    let description = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '';
-
-    // Clean up whitespace
-    title = title ? title.trim() : '';
-    description = description ? description.trim() : '';
-
-    console.log(`Scraped Title: ${title || '(empty)'}`); // Log if empty
-
-    return { title, description };
-
-  } catch (error) {
-    // Log more specific scraping errors
-    if (error.response) {
-        // The request was made and the server responded with a status code
-        // that falls out of the range of 2xx
-        console.warn(`Warning: Failed to scrape ${url}. Status: ${error.response.status}. Falling back.`);
-    } else if (error.request) {
-        // The request was made but no response was received
-        console.warn(`Warning: No response received for ${url}. Falling back.`);
-    } else {
-        // Something happened in setting up the request that triggered an Error
-        console.warn(`Warning: Error setting up request for ${url}: ${error.message}. Falling back.`);
-    }
-    return { title: url, description: '' };
-  }
-}
-
-// --- UPDATED: Database Function ---
-// It now accepts an 'apiKey' to find the specific user.
+// --- Database Function (Unchanged) ---
 async function getUserRule(apiKey) {
   if (!apiKey) {
     console.error("❌ No API key provided by the extension.");
-    return "Block all social media and news."; // A safe default
+    return "Block all social media, news, and entertainment."; // Default rule
   }
-
-  console.log("Fetching rule from database for key:", apiKey.substring(0, 5) + "...");
-  
-  const { data, error } = await supabase
-    .from('rules')
-    .select('prompt')
-    .eq('api_key', apiKey) // <-- Find the rule WHERE api_key matches
-    .single();
-    
+  console.log("Fetching rule for key:", apiKey.substring(0, 5) + "...");
+  const { data, error } = await supabase.from('rules').select('prompt').eq('api_key', apiKey).single();
   if (error || !data) {
     console.error("❌ Error fetching rule or key not found:", error?.message);
-    // If the key is bad, fall back to a default rule
-    return "Block all social media and news.";
+    return "Block all social media, news, and entertainment."; // Default rule
   }
-  
-  console.log("✅ Successfully fetched user-specific rule!");
+  console.log("✅ Successfully fetched rule!");
   return data.prompt;
 }
 
-// --- AI Decision Function (Updated) ---
-// It now needs the 'apiKey' to pass to the database function.
-async function getAIDecision(url, apiKey) {
-  
-  const { title, description } = await getPageContent(url);
-  
-  // GET THE SPECIFIC RULE FROM THE DATABASE
-  const userRule = await getUserRule(apiKey); 
-  
-  // --- Create a much smarter prompt ---
+// --- AI Decision Function (Takes data from request body) ---
+async function getAIDecision(pageData, apiKey) {
+  // Data comes directly from the extension now
+  const { title, description, h1, url } = pageData;
+  console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}'`);
+
+  const userRule = await getUserRule(apiKey);
+
   const prompt = `
     Analyze the webpage based on the following information:
     - Title: "${title}"
     - Description: "${description}"
+    - H1: "${h1}"
     - URL: "${url}"
-    
+
     My user's rule is: "${userRule}"
 
     INSTRUCTIONS:
-    1. Determine if the page content matches the user's ALLOW criteria based on their rule.
-    2. **IMPORTANT:** If the Title and Description are empty or very short, the page might load dynamically (like YouTube, Reddit, social media). In this case:
-        - Rely heavily on keywords and structure in the URL (e.g., '/watch', '/feed', '/explore', '/shorts', '/reels', '/education', '/learning').
-        - Be MORE LIKELY TO BLOCK common distracting domains (youtube.com, facebook.com, instagram.com, reddit.com, tiktok.com, twitter.com) UNLESS the URL path *clearly* indicates allowed content based on the user's rule (e.g., '/education').
-        - If the URL is just the base domain (e.g., 'youtube.com/') and the title is empty, it's likely a distracting feed - BLOCK it according to the rule.
-    3. Respond with *only* the word 'ALLOW' or 'BLOCK'. Be decisive based on the rule.
+    1. Determine if the page content matches the user's ALLOW criteria. Prioritize Title, H1, and Description.
+    2. If Title/Desc/H1 are empty/short, rely more on the URL structure and keywords (e.g., '/watch', '/feed', '/shorts', '/reels', '/education').
+    3. Be MORE LIKELY TO BLOCK common distracting domains (youtube.com, facebook.com, etc.) UNLESS the URL path *clearly* indicates allowed content (e.g., '/education').
+    4. Respond with *only* the word 'ALLOW' or 'BLOCK'. Be decisive.
   `;
-  
+
   try {
     const result = await model.generateContent(prompt);
     const response = await result.response;
     let decision = response.text().trim().toUpperCase();
     if (decision !== 'ALLOW' && decision !== 'BLOCK') {
-      console.warn('AI gave an unclear answer. Defaulting to BLOCK.');
+      console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
       decision = 'BLOCK';
     }
     console.log(`AI decision for ${url} is: ${decision}`);
     return decision;
   } catch (error) {
-    console.error('Error contacting AI:', error);
-    return 'BLOCK';
+    console.error('Error contacting AI:', error.message);
+    return 'BLOCK'; // Fail-safe block
   }
 }
 
-// --- API Endpoint (Should be POST) ---
-app.post('/check-url', async (req, res) => { // <-- CORRECT: app.post
-  
+// --- API Endpoint (Correct POST handling) ---
+app.post('/check-url', async (req, res) => { // <-- Ensure this is app.post
+
   // Data now comes from the request body
-  const pageData = req.body; 
+  const pageData = req.body;
   const url = pageData?.url; // Get URL from body data
 
-  const authHeader = req.headers['authorization']; 
-  const apiKey = authHeader ? authHeader.split(' ')[1] : null; 
-  
+  const authHeader = req.headers['authorization'];
+  const apiKey = authHeader ? authHeader.split(' ')[1] : null;
+
   console.log('Received POST request for:', url || 'No URL in body');
 
   // Basic validation
   if (!url || !apiKey) {
-      console.error('Missing URL in request body or API key in header.');
-      // Send an error response back to the extension
-      return res.status(400).json({ error: 'Missing URL or API Key' }); 
+      console.error('Missing URL in body or API key in header.');
+      return res.status(400).json({ error: 'Missing URL or API Key' });
   }
-
-  // No need to check for chrome:// URLs here, content script shouldn't send them
 
   try {
     // Pass the entire pageData object to the decision function
-    const decision = await getAIDecision(pageData, apiKey); 
+    const decision = await getAIDecision(pageData, apiKey);
     res.json({ decision: decision });
   } catch (err) {
-      // Catch any unexpected errors during processing
       console.error("Error processing /check-url:", err);
       res.status(500).json({ error: "Internal Server Error" });
   }
@@ -204,6 +111,5 @@ app.post('/check-url', async (req, res) => { // <-- CORRECT: app.post
 
 // --- Start the server ---
 app.listen(port, () => {
-  // --- UPDATED LOG MESSAGE ---
-  console.log(`✅ SERVER IS LIVE (with User Auth) and listening on port ${port}`);
+  console.log(`✅ SERVER IS LIVE (Content Script Mode) on port ${port}`);
 });
