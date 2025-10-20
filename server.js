@@ -28,7 +28,7 @@ if (!apiKey) {
 console.log("✅ 7. Google API key found.");
 
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
 console.log("✅ 8. AI Model selected.");
 
 // --- NEW SUPABASE SETUP ---
@@ -50,17 +50,53 @@ const port = 3000;
 app.use(cors());
 console.log("✅ 10. Express server configured.");
 
-// --- Scraper Function (No changes) ---
+// --- Updated Scraper Function ---
 async function getPageContent(url) {
   try {
-    const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36' } });
+    const response = await axios.get(url, {
+      headers: {
+        // --- Use a more modern User-Agent ---
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9', // Tell server we prefer English
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' // Standard accept header
+      },
+      timeout: 4000 // Add a timeout (e.g., 4 seconds) to prevent hanging on slow sites
+    });
+
+    // Simple check if the response looks like HTML
+    const contentType = response.headers['content-type'];
+    if (!contentType || !contentType.includes('html')) {
+        console.warn(`Warning: Response from ${url} is not HTML (${contentType}). Falling back to URL-only.`);
+        return { title: url, description: '' };
+    }
+
     const $ = cheerio.load(response.data);
-    const title = $('title').text();
-    const description = $('meta[name="description"]').attr('content') || '';
-    console.log(`Scraped Title: ${title}`);
+
+    // --- Try Open Graph tags first, then fall back to standard tags ---
+    let title = $('meta[property="og:title"]').attr('content') || $('title').text();
+    let description = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '';
+
+    // Clean up whitespace
+    title = title ? title.trim() : '';
+    description = description ? description.trim() : '';
+
+    console.log(`Scraped Title: ${title || '(empty)'}`); // Log if empty
+
     return { title, description };
+
   } catch (error) {
-    console.warn(`Warning: Failed to scrape ${url}. Falling back to URL-only.`);
+    // Log more specific scraping errors
+    if (error.response) {
+        // The request was made and the server responded with a status code
+        // that falls out of the range of 2xx
+        console.warn(`Warning: Failed to scrape ${url}. Status: ${error.response.status}. Falling back.`);
+    } else if (error.request) {
+        // The request was made but no response was received
+        console.warn(`Warning: No response received for ${url}. Falling back.`);
+    } else {
+        // Something happened in setting up the request that triggered an Error
+        console.warn(`Warning: Error setting up request for ${url}: ${error.message}. Falling back.`);
+    }
     return { title: url, description: '' };
   }
 }
@@ -100,14 +136,22 @@ async function getAIDecision(url, apiKey) {
   // GET THE SPECIFIC RULE FROM THE DATABASE
   const userRule = await getUserRule(apiKey); 
   
+  // --- Create a much smarter prompt ---
   const prompt = `
-    Analyze the following webpage content:
+    Analyze the webpage based on the following information:
     - Title: "${title}"
     - Description: "${description}"
     - URL: "${url}"
+    
     My user's rule is: "${userRule}"
-    Based on the page content and the user's rule, is this website allowed?
-    Respond with *only* the word 'ALLOW' or 'BLOCK'.
+
+    INSTRUCTIONS:
+    1. Determine if the page content matches the user's ALLOW criteria based on their rule.
+    2. **IMPORTANT:** If the Title and Description are empty or very short, the page might load dynamically (like YouTube, Reddit, social media). In this case:
+        - Rely heavily on keywords and structure in the URL (e.g., '/watch', '/feed', '/explore', '/shorts', '/reels', '/education', '/learning').
+        - Be MORE LIKELY TO BLOCK common distracting domains (youtube.com, facebook.com, instagram.com, reddit.com, tiktok.com, twitter.com) UNLESS the URL path *clearly* indicates allowed content based on the user's rule (e.g., '/education').
+        - If the URL is just the base domain (e.g., 'youtube.com/') and the title is empty, it's likely a distracting feed - BLOCK it according to the rule.
+    3. Respond with *only* the word 'ALLOW' or 'BLOCK'. Be decisive based on the rule.
   `;
   
   try {
@@ -155,5 +199,6 @@ app.get('/check-url', async (req, res) => {
 
 // --- Start the server ---
 app.listen(port, () => {
-  console.log("✅ 11. SERVER IS LIVE (with User Auth) at http://localhost:3000");
+  // --- UPDATED LOG MESSAGE ---
+  console.log(`✅ SERVER IS LIVE (with User Auth) and listening on port ${port}`);
 });
