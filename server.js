@@ -1,130 +1,161 @@
-// --- Imports ---
+// --- Imports (Keep all existing imports) ---
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-// REMOVE axios and cheerio - no longer needed!
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 
-// --- Setup (AI, Supabase) ---
-const apiKey = process.env.GOOGLE_API_KEY;
-if (!apiKey) { console.error("❌ FATAL ERROR: GOOGLE_API_KEY missing!"); process.exit(1); }
-const genAI = new GoogleGenerativeAI(apiKey);
-// --- Use the model that worked best for you (1.0-pro recommended for accuracy) ---
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-console.log("Using AI Model:", "gemini-flash-latest");
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-if (!supabaseUrl || !supabaseKey) { console.error("❌ FATAL ERROR: Supabase config missing!"); process.exit(1); }
+// --- Setup (AI, Supabase, Server - Keep existing) ---
+// ... (Make sure AI model, Supabase client, app, port are set up) ...
+const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" }); // Or gemini-1.0-pro
 const supabase = createClient(supabaseUrl, supabaseKey);
-
-// --- Server Setup ---
 const app = express();
-const port = process.env.PORT || 3000; // Use Render's port or default to 3000
+const port = process.env.PORT || 3000;
 app.use(cors());
-app.use(express.json()); // <-- ***** ADD THIS LINE ***** Middleware to parse JSON
+app.use(express.json());
 
-// --- Database Function (Unchanged) ---
-async function getUserRule(apiKey) {
-  if (!apiKey) {
-    console.error("❌ No API key provided by the extension.");
-    return "Block all social media, news, and entertainment."; // Default rule
-  }
-  console.log("Fetching rule for key:", apiKey.substring(0, 5) + "...");
-  const { data, error } = await supabase.from('rules').select('prompt').eq('api_key', apiKey).single();
-  if (error || !data) {
-    console.error("❌ Error fetching rule or key not found:", error?.message);
-    return "Block all social media, news, and entertainment."; // Default rule
-  }
-  console.log("✅ Successfully fetched rule!");
-  return data.prompt;
+// --- Helper: getDomainFromUrl (Keep existing) ---
+function getDomainFromUrl(urlString) {
+    try {
+        const url = new URL(urlString);
+        const parts = url.hostname.split('.');
+        if (parts.length >= 2) { return parts.slice(-2).join('.').toLowerCase(); }
+        return url.hostname.toLowerCase();
+    } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
-// --- AI Decision Function (Takes data from request body) ---
-async function getAIDecision(pageData, apiKey) {
-  // Data comes directly from the extension now
-  const { title, description, h1, url } = pageData;
-  console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}'`);
+// --- UPDATED: Database Function - Fetches Structured Rule ---
+async function getUserRuleData(apiKey) {
+    if (!apiKey) {
+        console.error("❌ No API key provided.");
+        // Return default structured data on failure
+        return { prompt: "Block social media and news.", allow_list: [], block_list: [], blocked_categories: {} };
+    }
+    console.log("Fetching rule data for key:", apiKey.substring(0, 5) + "...");
 
-  const userRule = await getUserRule(apiKey);
+    // Fetch all the relevant columns now
+    const { data, error } = await supabase
+        .from('rules')
+        .select('prompt, allow_list, block_list, blocked_categories') // Select new columns
+        .eq('api_key', apiKey)
+        .single();
 
-  const prompt = `
-    Analyze the webpage based on the following information:
+    if (error || !data) {
+        console.error("❌ Error fetching rule data or key not found:", error?.message);
+        // Return default structured data on failure
+        return { prompt: "Block social media and news.", allow_list: [], block_list: [], blocked_categories: {} };
+    }
+
+    console.log("✅ Successfully fetched rule data!");
+    // Ensure lists are arrays even if DB returns null
+    data.allow_list = data.allow_list || [];
+    data.block_list = data.block_list || [];
+    data.blocked_categories = data.blocked_categories || {};
+    return data; // Return the whole data object
+}
+
+// --- AI Decision Function (UPDATED - accepts structured ruleData) ---
+async function getAIDecision(pageData, ruleData) { // Takes ruleData object now
+    const { title, description, h1, url, searchQuery } = pageData;
+    const { prompt: userMainPrompt, blocked_categories } = ruleData; // Extract needed parts
+
+    console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}', Query='${searchQuery || '(none)'}'`);
+
+    // --- Construct prompt using structured data ---
+    let finalPrompt = userMainPrompt; // Start with the main text prompt
+
+    // Get labels for checked categories (using the global constant if available, otherwise just keys)
+    // You might need to define BLOCKED_CATEGORIES here or pass it if needed, or just use keys.
+    const selectedCategoryKeys = Object.entries(blocked_categories || {})
+        .filter(([, value]) => value === true)
+        .map(([key]) => key); // Just use the keys (e.g., 'social', 'news')
+
+    if (selectedCategoryKeys.length > 0) {
+        finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryKeys.join('\n- ')}`;
+    }
+
+    // --- Append general instructions ---
+     finalPrompt += `\n\nAnalyze the webpage based on the following information:
     - Title: "${title}"
     - Description: "${description}"
     - H1: "${h1}"
     - URL: "${url}"
+    - Search Query that led here (if applicable): "${searchQuery || 'N/A'}"
 
-    My user's rule is: "${userRule}"
+    My user's rule details are above.
 
-    INSTRUCTIONS:
-    1. Determine if the page content matches the user's ALLOW criteria. Prioritize Title, H1, and Description.
-    2. If Title/Desc/H1 are empty/short, rely more on the URL structure and keywords (e.g., '/watch', '/feed', '/shorts', '/reels', '/education').
-    3. Be MORE LIKELY TO BLOCK common distracting domains (youtube.com, facebook.com, etc.) UNLESS the URL path *clearly* indicates allowed content (e.g., '/education').
-    4. Respond with *only* the word 'ALLOW' or 'BLOCK'. Be decisive.
-  `;
+    **CRITICAL BLOCKING INSTRUCTIONS:**
+    1. Prioritize any "Always Block" or "Always Allow" lists provided separately (handled before this call).
+    2. Strictly follow the "Explicitly Blocked Categories" if listed.
+    3. Use the main user rule text for overall guidance and nuance.
+    4. Pay attention to URL structure for dynamic sites if Title/Desc are weak.
+    5. Respond with *only* ALLOW or BLOCK. Be decisive.
+    `;
+    // --- End prompt construction ---
 
-  try {
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    let decision = response.text().trim().toUpperCase();
-    if (decision !== 'ALLOW' && decision !== 'BLOCK') {
-      console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
-      decision = 'BLOCK';
+    try {
+        const result = await model.generateContent(finalPrompt); // Send the combined prompt
+        const response = await result.response;
+        let decision = response.text().trim().toUpperCase();
+        if (decision !== 'ALLOW' && decision !== 'BLOCK') {
+            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
+            decision = 'BLOCK';
+        }
+        console.log(`AI decision for ${url} is: ${decision}`);
+        return decision;
+    } catch (error) {
+        console.error('Error contacting AI:', error.message);
+        return 'BLOCK';
     }
-    console.log(`AI decision for ${url} is: ${decision}`);
-    return decision;
-  } catch (error) {
-    console.error('Error contacting AI:', error.message);
-    return 'BLOCK'; // Fail-safe block
-  }
 }
 
-// --- API Endpoint (Add Search Check) ---
+// --- API Endpoint (UPDATED with structured data pre-filtering) ---
 app.post('/check-url', async (req, res) => {
-  const pageData = req.body;
-  const url = pageData?.url;
-  const authHeader = req.headers['authorization'];
-  const apiKey = authHeader ? authHeader.split(' ')[1] : null;
+    const pageData = req.body;
+    const url = pageData?.url;
+    const authHeader = req.headers['authorization'];
+    const apiKey = authHeader ? authHeader.split(' ')[1] : null;
 
-  console.log('Received POST request for:', url || 'No URL in body');
+    console.log('Received POST request for:', url || 'No URL in body');
 
-  // --- NEW: Immediately ALLOW known search engine results pages ---
-  try {
-      if (url) {
-          const urlObj = new URL(url);
-          const hostname = urlObj.hostname;
-          // Add more search engines if needed
-          if ((hostname.includes("google.") || hostname.includes("bing.") || hostname.includes("duckduckgo.")) && urlObj.pathname.startsWith("/search")) {
-              console.log("Search engine results page detected. Allowing automatically.");
-              res.json({ decision: 'ALLOW' });
-              return; // Stop processing, send ALLOW
-          }
-      }
-  } catch (e) {
-      console.warn("Error checking for search engine URL:", e); // Log error but continue
-  }
-  // --- END NEW SEARCH CHECK ---
+    if (!url || !apiKey) {
+        return res.status(400).json({ error: 'Missing URL or API Key' });
+    }
 
+    try {
+        // --- PRE-FILTERING uses structured data ---
+        // 1. Fetch the structured rule data
+        const ruleData = await getUserRuleData(apiKey);
+        const { allow_list, block_list } = ruleData; // Get lists directly
 
-  // Basic validation (still important)
-  if (!url || !apiKey) {
-      console.error('Missing URL in body or API key in header.');
-      return res.status(400).json({ error: 'Missing URL or API Key' });
-  }
+        // 2. Get the current domain
+        const currentDomain = getDomainFromUrl(url);
 
-  // If not a search page, proceed with AI check
-  try {
-    const decision = await getAIDecision(pageData, apiKey);
-    res.json({ decision: decision });
-  } catch (err) {
-      console.error("Error processing /check-url:", err);
-      res.status(500).json({ error: "Internal Server Error" });
-  }
+        // 3. Check Allow List (using array includes/endsWith)
+        if (currentDomain && allow_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
+            console.log(`URL domain (${currentDomain}) matches Allow list. ALLOWING.`);
+            return res.json({ decision: 'ALLOW' });
+        }
+
+        // 4. Check Block List (using array includes/endsWith)
+        if (currentDomain && block_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
+            console.log(`URL domain (${currentDomain}) matches Block list. BLOCKING.`);
+            return res.json({ decision: 'BLOCK' });
+        }
+
+        // 5. If not pre-filtered, proceed to AI check
+        console.log("URL not in pre-filter lists. Proceeding to AI check.");
+        // Pass the full ruleData object to the AI function
+        const decision = await getAIDecision(pageData, ruleData);
+        res.json({ decision: decision });
+
+    } catch (err) {
+        console.error("Error during pre-filtering or AI check:", err);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
 });
 
-// --- Start the server ---
+// --- Start the server (Unchanged) ---
 app.listen(port, () => {
-  console.log(`✅ SERVER IS LIVE (Content Script Mode) on port ${port}`);
+    console.log(`✅ SERVER IS LIVE (Structured Rules) on port ${port}`);
 });
