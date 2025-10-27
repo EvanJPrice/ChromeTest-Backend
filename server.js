@@ -6,13 +6,29 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 
 // --- Setup (AI, Supabase, Server - Keep existing) ---
-// ... (Make sure AI model, Supabase client, app, port are set up) ...
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" }); // Or gemini-1.0-pro
+
+// 1. Read environment variables loaded by dotenv
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const geminiKey = process.env.GOOGLE_API_KEY;
+
+// 2. Check if keys are missing (good practice for servers)
+if (!supabaseUrl || !supabaseKey || !geminiKey) {
+  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, and GOOGLE_API_KEY.");
+  // Don't start the server if keys are missing
+  process.exit(1); 
+}
+
+// 3. Initialize your clients (THIS IS THE FIX)
+const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// 4. Continue with your existing code
+const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" }); // Or gemini-1.0-pro
 const app = express();
-const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
+const port = process.env.PORT || 3000;
 
 // --- Helper: getDomainFromUrl (Keep existing) ---
 function getDomainFromUrl(urlString) {
@@ -38,9 +54,10 @@ async function getUserRuleData(apiKey) {
         .from('rules')
         .select('prompt, allow_list, block_list, blocked_categories') // Select new columns
         .eq('api_key', apiKey)
-        .single();
+        .single(); // Use .single() now that we know the key exists
 
     if (error || !data) {
+        // Log the specific error if it happens again
         console.error("❌ Error fetching rule data or key not found:", error?.message);
         // Return default structured data on failure
         return { prompt: "Block social media and news.", allow_list: [], block_list: [], blocked_categories: {} };
@@ -55,57 +72,77 @@ async function getUserRuleData(apiKey) {
 }
 
 // --- AI Decision Function (UPDATED - accepts structured ruleData) ---
-async function getAIDecision(pageData, ruleData) { // Takes ruleData object now
+async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery } = pageData;
-    const { prompt: userMainPrompt, blocked_categories } = ruleData; // Extract needed parts
+    const { prompt: userMainPrompt, blocked_categories } = ruleData; // Extract raw data
 
-    console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}', Query='${searchQuery || '(none)'}'`);
+    console.log(`AI Check: Title='${title || '(empty)'}', URL='${url}'`);
 
-    // --- Construct prompt using structured data ---
-    let finalPrompt = userMainPrompt; // Start with the main text prompt
+    // --- NEW: Construct a structured, unambiguous prompt ---
 
-    // Get labels for checked categories (using the global constant if available, otherwise just keys)
-    // You might need to define BLOCKED_CATEGORIES here or pass it if needed, or just use keys.
-    const selectedCategoryKeys = Object.entries(blocked_categories || {})
+    // 1. Get the labels of the toggled categories
+    // (We need to define BLOCKED_CATEGORIES here, or just use the keys)
+    const BLOCKED_CATEGORY_LABELS = {
+        'social': 'Social Media (Facebook, Instagram, TikTok, etc.)',
+        'news': 'News & Politics',
+        'entertainment': 'Entertainment (Streaming, non-educational YouTube)',
+        'games': 'Games',
+        'shopping': 'Online Shopping (General)',
+        'mature': 'Mature Content (Violence, Adult Themes, etc.)'
+    };
+
+    const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
-        .map(([key]) => key); // Just use the keys (e.g., 'social', 'news')
+        .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key); // Get the full label
 
-    if (selectedCategoryKeys.length > 0) {
-        finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryKeys.join('\n- ')}`;
-    }
+    // 2. Build the final prompt
+    let finalPrompt = `You are an AI web filter. Your goal is to help a user focus or stay safe.
+The user has already set "Always Allow" and "Always Block" lists. This URL was NOT on those lists.
+Your job is to decide if this page should be blocked based on the user's general policy.
 
-    // --- Append general instructions ---
-     finalPrompt += `\n\nAnalyze the webpage based on the following information:
-    - Title: "${title}"
-    - Description: "${description}"
-    - H1: "${h1}"
-    - URL: "${url}"
-    - Search Query that led here (if applicable): "${searchQuery || 'N/A'}"
+---
+**User's General Policy (Main Prompt):**
+"${userMainPrompt || 'No general policy provided. Rely on the blocked categories.'}"
 
-    My user's rule details are above.
+---
+**User's Pre-set Categories to Block:**
+${selectedCategoryLabels.length > 0 ? selectedCategoryLabels.map(label => `- ${label}`).join('\n') : 'No specific categories are pre-blocked.'}
 
-    **CRITICAL BLOCKING INSTRUCTIONS:**
-    1. Prioritize any "Always Block" or "Always Allow" lists provided separately (handled before this call).
-    2. Strictly follow the "Explicitly Blocked Categories" if listed.
-    3. Use the main user rule text for overall guidance and nuance.
-    4. Pay attention to URL structure for dynamic sites if Title/Desc are weak.
-    5. Respond with *only* ALLOW or BLOCK. Be decisive.
-    `;
-    // --- End prompt construction ---
+---
+**Webpage to Analyze:**
+- URL: "${url}"
+- Title: "${title || 'N/A'}"
+- H1 Header: "${h1 || 'N/A'}"
+- Description: "${description || 'N/A'}"
+- Search Query (if any): "${searchQuery || 'N/A'}"
+
+---
+**Your Decision:**
+Based on the user's policy and pre-set categories, should this page be BLOCKED or ALLOWED?
+Respond with *only* the single word: ALLOW or BLOCK
+`;
+    // --- End of new prompt construction ---
 
     try {
-        const result = await model.generateContent(finalPrompt); // Send the combined prompt
+        const result = await model.generateContent(finalPrompt);
         const response = await result.response;
         let decision = response.text().trim().toUpperCase();
-        if (decision !== 'ALLOW' && decision !== 'BLOCK') {
-            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
+        
+        if (decision.includes('BLOCK')) {
             decision = 'BLOCK';
+        } else if (decision.includes('ALLOW')) {
+            decision = 'ALLOW';
+        } else {
+            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to ALLOW.');
+            decision = 'ALLOW'; // Default to ALLOW for edge cases to be less disruptive
         }
+
         console.log(`AI decision for ${url} is: ${decision}`);
         return decision;
     } catch (error) {
         console.error('Error contacting AI:', error.message);
-        return 'BLOCK';
+        // Default to ALLOW to avoid over-blocking on AI errors
+        return 'ALLOW';
     }
 }
 
