@@ -11,7 +11,7 @@ const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const geminiKey = process.env.GOOGLE_API_KEY;
 
 if (!supabaseUrl || !supabaseKey || !geminiKey) {
-  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, and GOOGLE_API_KEY.");
+  console.error("❌ ERROR: Missing .env variables!");
   process.exit(1); 
 }
 
@@ -55,11 +55,15 @@ function getDomainFromUrl(urlString) {
 // --- Helper: Log Blocking Event ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
-    if (!userId) return; 
     
-    // --- UPDATED LOGIC ---
-    // Only skip "Infra" rules (like dashboard loading). 
-    // We WANT to log "System Rule (Search)" and "System Rule (YT)".
+    if (!userId) {
+        console.log("⚠️ Skipping log: No User ID found.");
+        return; 
+    }
+    
+    // --- THE FIX IS HERE ---
+    // Only skip strictly internal system rules (like the dashboard itself).
+    // We WANT to log search engines and YouTube browsing.
     if (reason && reason.startsWith('System Rule (Infra)')) {
         return; 
     }
@@ -74,7 +78,8 @@ async function logBlockingEvent(logData) {
             reason: reason,
             page_title: pageTitle || ''
         });
-        if (error) console.error("Error logging event:", error.message);
+        if (error) console.error("❌ Database Error logging event:", error.message);
+        else console.log(`✅ Logged event: ${decision} - ${reason}`);
     } catch (err) {
         console.error("Exception during logging:", err.message);
     }
@@ -106,16 +111,13 @@ async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
-    console.log(`AI Check: Title='${title || '(empty)'}', URL='${url}'`);
+    console.log(`AI Input: Title='${title}', URL='${url}'`);
 
     let finalPrompt = userMainPrompt || "No prompt provided."; 
     const BLOCKED_CATEGORY_LABELS = {
-        'social': 'Social Media (Facebook, Instagram, TikTok, etc.)',
-        'news': 'News & Politics',
-        'entertainment': 'Entertainment (Streaming, non-educational YouTube)',
-        'games': 'Games',
-        'shopping': 'Online Shopping (General)',
-        'mature': 'Mature Content (Violence, Adult Themes, etc.)'
+        'social': 'Social Media', 'news': 'News & Politics',
+        'entertainment': 'Entertainment', 'games': 'Games',
+        'shopping': 'Online Shopping', 'mature': 'Mature Content'
     };
     const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
@@ -129,17 +131,16 @@ async function getAIDecision(pageData, ruleData) {
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
     - H1 Header: "${h1 || 'N/A'}"
-    - Meta Description: "${description || 'N/A'}"
-    - Meta Keywords: "${keywords || 'N/A'}" 
-    - Body Text Snippet: "${bodyText || 'N/A'}" 
-    - Search Query (context only): "${searchQuery || 'N/A'}"
+    - Description: "${description || 'N/A'}"
+    - Keywords: "${keywords || 'N/A'}" 
+    - Body Snippet: "${bodyText || 'N/A'}" 
+    - Search Query (context): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
-    **CRITICAL BLOCKING INSTRUCTIONS:**
-    1. Prioritize any "Always Block" or "Always Allow" lists provided separately.
-    2. Strictly follow the "Explicitly Blocked Categories".
-    3. Use the main user rule text for overall guidance.
-    4. Respond with *only* ALLOW or BLOCK.
+    **CRITICAL INSTRUCTIONS (In Order of Priority):**
+    1. **User's Main Prompt:** This is the highest priority. If the user explicitly allows a specific site or topic (e.g., "Allow YouTube", "Allow Twitter"), you MUST ALLOW it, even if it fits a blocked category.
+    2. **Blocked Categories:** If the page fits a blocked category and is NOT exempted by the Main Prompt, BLOCK it.
+    3. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
     try {
@@ -147,12 +148,14 @@ async function getAIDecision(pageData, ruleData) {
         const response = await result.response;
         let decision = response.text().trim().toUpperCase();
         
-        if (decision.includes('BLOCK')) return 'BLOCK';
-        if (decision.includes('ALLOW')) return 'ALLOW';
+        if (decision.includes('BLOCK')) decision = 'BLOCK';
+        else if (decision.includes('ALLOW')) decision = 'ALLOW';
+        else decision = 'BLOCK'; 
         
-        return 'BLOCK'; // Default safety
+        console.log(`AI Output: ${decision}`);
+        return decision;
     } catch (error) {
-        console.error('Error contacting AI:', error.message);
+        console.error('AI Error:', error.message);
         return 'BLOCK';
     }
 }
@@ -171,78 +174,76 @@ app.post('/check-url', async (req, res) => {
     let userId = null;
 
     try {
-        // --- 1. SMART ALLOWS (Save Tokens & Protect Infra) ---
+        // Fetch rules FIRST to get userId for logging
+        const ruleData = await getUserRuleData(apiKey);
+        if (!ruleData) return res.status(401).json({ error: "Invalid API Key" });
+        
+        userId = ruleData.user_id;
+        const { allow_list, block_list } = ruleData;
+        
         const urlObj = new URL(url);
         const hostname = urlObj.hostname.toLowerCase();
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // A. Dashboard & Infrastructure (Hidden from logs)
+        // --- 1. SYSTEM ALLOWS (Infra - Hidden from Logs) ---
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              console.log(`System Allow: Infra (${baseDomain})`);
-             // We keep this reason starting with "System Rule (Infra)" so it stays HIDDEN from the feed
+             // Log as "System Rule (Infra)" so it's SKIPPED by the helper
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // B. Search Engines (Home & Results only)
+        // --- 2. SEARCH ENGINE ALLOWS (Logged!) ---
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
-             // Detect the Engine Name
+             // Detect Engine Name
              let engine = "Search Engine";
              if (hostname.includes('google')) engine = "Google";
              else if (hostname.includes('bing')) engine = "Bing";
              else if (hostname.includes('duckduckgo')) engine = "DuckDuckGo";
 
-             const displayTitle = pageData.searchQuery ? `${engine}: "${pageData.searchQuery}"` : `${engine} Home`;
+             const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
              console.log(`System Allow: ${displayTitle}`);
              
+             // Log with a CLEAN reason
              await logBlockingEvent({
                  userId, 
                  url, 
                  decision: 'ALLOW', 
-                 reason: 'Search Allowed', // <--- Much cleaner reason
+                 reason: 'Search Allowed', 
                  pageTitle: displayTitle 
              });
              return res.json({ decision: 'ALLOW' });
         }
 
-        // C. YouTube (Home & Search only)
+        // --- 3. YOUTUBE BROWSING ALLOWS (Logged!) ---
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
                  
                  const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
                  console.log(`System Allow: ${displayTitle}`);
 
+                 // Log with a CLEAN reason
                  await logBlockingEvent({
                      userId, 
                      url, 
                      decision: 'ALLOW', 
-                     reason: 'YouTube Navigation', // <--- Much cleaner reason
+                     reason: 'YouTube Navigation', 
                      pageTitle: displayTitle
                  });
                  return res.json({ decision: 'ALLOW' });
             }
         }
-        
-        // --- 2. Fetch User Rules ---
-        const ruleData = await getUserRuleData(apiKey);
-        if (!ruleData) {
-            return res.status(401).json({ error: "Invalid API Key" });
-        }
-        
-        userId = ruleData.user_id;
-        const { allow_list, block_list } = ruleData;
 
-        // --- 3. User Allow List ---
+        // --- 4. User Lists ---
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Allow: ${baseDomain}`);
             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 4. User Block List ---
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Block: ${baseDomain}`);
             await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
@@ -250,13 +251,13 @@ app.post('/check-url', async (req, res) => {
         }
 
         // --- 5. AI Check ---
-        console.log("AI Check for:", url);
+        console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
         res.json({ decision: decision });
 
     } catch (err) {
-        console.error("Error in check-url:", err.message);
+        console.error("Server Error:", err.message);
         await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Server Error', pageTitle: pageData?.title});
         res.status(500).json({ error: "Internal Server Error" });
     }
