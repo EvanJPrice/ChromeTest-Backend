@@ -57,8 +57,7 @@ async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
     
-    // --- THE FIX: Only skip INFRASTRUCTURE logs ---
-    // We want to see "Search Allowed" and "YouTube Navigation"
+    // Only skip strictly internal system rules (dashboard/infra)
     if (reason && reason.startsWith('System Rule (Infra)')) {
         return; 
     }
@@ -166,20 +165,20 @@ app.post('/check-url', async (req, res) => {
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // A. Infrastructure (Log as Infra -> Skipped by logger)
+        // A. Infrastructure (Hidden from Logs)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              console.log(`System Allow: Infra (${baseDomain})`);
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Fetch User Rules (Need userId for logging below)
+        // 2. Fetch User Rules (Need userId for logging)
         const ruleData = await getUserRuleData(apiKey);
         if (!ruleData) return res.status(401).json({ error: "Invalid API Key" });
         userId = ruleData.user_id;
         const { allow_list, block_list } = ruleData;
 
-        // B. Search Engines (Now using clean names!)
+        // B. Search Engines
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
@@ -201,11 +200,15 @@ app.post('/check-url', async (req, res) => {
              return res.json({ decision: 'ALLOW' });
         }
 
-        // C. YouTube Browsing (Now using clean names!)
+        // C. YouTube Browsing (UPDATED)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
                  
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
+                 // Use the Search Query if present, otherwise use the PAGE TITLE (e.g., "MrBeast - YouTube")
+                 const displayTitle = pageData.searchQuery 
+                    ? `Youtube: "${pageData.searchQuery}"` 
+                    : (pageData.title || "YouTube Browsing");
+
                  console.log(`System Allow: ${displayTitle}`);
 
                  await logBlockingEvent({
@@ -222,13 +225,13 @@ app.post('/check-url', async (req, res) => {
         // --- 3. User Lists ---
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Allow: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Block: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
