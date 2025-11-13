@@ -1,5 +1,5 @@
 // FILE: server.js
-// VERSION: v5.3 (Nuanced Prompt + Silent System Rules)
+// VERSION: v5.0 (Explicit Category Nuance)
 
 // --- Imports ---
 require('dotenv').config();
@@ -20,7 +20,7 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-// Temp 0 for consistency
+// Temp 0 for consistent decisions
 const model = genAI.getGenerativeModel({ 
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -59,13 +59,8 @@ async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
     
-    // Only skip strictly internal infrastructure logs
-    // (Search Allowed and YT Navigation are now logged again per v5.3 requirement?)
-    // Wait - you asked for SILENT System Rules in v5.3 description ("hiding search noise").
-    // So we keep this check strict:
-    if (reason && (reason.startsWith('System Rule') || reason === 'Search Allowed' || reason === 'YouTube Navigation')) {
-        return; 
-    }
+    // Skip logging strictly internal infrastructure
+    if (reason && reason.startsWith('System Rule (Infra)')) return; 
 
     try {
         const domain = getDomainFromUrl(url);
@@ -96,7 +91,7 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (v5.1 Logic - Clear Nuance) ---
+// --- AI Decision Function (With Explicit Nuance) ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
@@ -184,39 +179,46 @@ app.post('/check-url', async (req, res) => {
 
         // 1. Infrastructure (Hidden)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
-             // SILENT ALLOW
+             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (Hidden)
+        // 2. Search Engines (Logged)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
-             console.log("System Allow: Search Engine (Silent)");
-             // SILENT ALLOW
+             
+             let engine = "Search Engine";
+             if (hostname.includes('google')) engine = "Google";
+             else if (hostname.includes('bing')) engine = "Bing";
+             const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
+             
+             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (Hidden)
+        // 3. YouTube Browsing (Logged)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                 console.log("System Allow: YouTube Browsing (Silent)");
-                 // SILENT ALLOW
+                 
+                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Navigation";
+
+                 await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
                  return res.json({ decision: 'ALLOW' });
             }
         }
         
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check (The ONLY place Search Query appears in logs)
+        // 5. AI Check
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
