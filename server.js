@@ -1,7 +1,5 @@
 // FILE: server.js
-// VERSION: v4.2 (Matching Search Queries, Improved Log Suppression)
-// DESCRIPTION: Express server for content filtering using Google Gemini AI and Supabase.
-//              Improved to guarantee ALLOW on search query matches and suppress certain log entries.
+// VERSION: v5.1 (Strict Category Definitions)
 
 // --- Imports ---
 require('dotenv').config();
@@ -22,6 +20,7 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
+// Temp 0 for consistency
 const model = genAI.getGenerativeModel({ 
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -56,21 +55,11 @@ function getDomainFromUrl(urlString) {
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
-// --- Helper: Log Blocking Event (UPDATED SUPPRESSION) ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
-
-    // --- THE FIX: Explicitly skip Search and Navigation logs ---
-    // We want to keep the feed clean for the user.
-    // We skip if it's an internal system rule, a search engine, or YouTube navigation.
-    if (reason === 'System Rule (Infra)' || 
-        reason === 'Search Allowed' || 
-        reason === 'YouTube Navigation') {
-        
-        // console.log(`Skipping log for: ${reason}`); // Optional debug
-        return; 
-    }
+    
+    if (reason && reason.startsWith('System Rule (Infra)')) return; 
 
     try {
         const domain = getDomainFromUrl(url);
@@ -101,21 +90,17 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (v4 - Search Match Guarantee) ---
+// --- AI Decision Function (v5.1 - Clearer Definitions) ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Input: Title='${title}'`);
 
-    // --- 1. PRE-CHECK: EXACT SEARCH MATCH ---
-    // If the search query is very similar to the video title, ALLOW immediately.
-    // This fixes the "Octopus Piano" issue where specific intent was ignored.
+    // 1. Auto-Allow Exact Title/Search Matches (Zero Cost Safety Net)
     if (searchQuery && title) {
         const cleanSearch = searchQuery.toLowerCase().trim();
         const cleanTitle = title.toLowerCase().trim();
-        
-        // If the title contains the search query (or vice versa), it's a match.
         if (cleanTitle.includes(cleanSearch) || cleanSearch.includes(cleanTitle)) {
             console.log(`Auto-Allow: Search '${cleanSearch}' matches title.`);
             return 'ALLOW';
@@ -136,6 +121,7 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
+    // --- UPDATED PROMPT INSTRUCTIONS V5.1 ---
     finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -145,13 +131,13 @@ async function getAIDecision(pageData, ruleData) {
     - Search Query (Context): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
-    **CRITICAL INSTRUCTIONS:**
-    1. **User's Main Prompt:** Highest priority. If they say "Allow YouTube", accept it regardless of category.
-    2. **Search Context:** If the Search Query matches the content topic, ALLOW it.
-    3. **Context Nuance:**
-       - **"Games":** Block gameplay. ALLOW reviews, news, analysis.
-       - **"Shopping":** Block stores. ALLOW reviews/unboxing.
-       - **"Entertainment":** Block mindless streaming. ALLOW creative projects, skill-building, and educational content.
+    **CRITICAL INSTRUCTIONS (Priority Order):**
+    1. **User's Main Prompt:** Highest priority. If they explicitly allow a topic, ALLOW it.
+    2. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
+    3. **Category Definitions (Strict):**
+       - **"Games":** Refers ONLY to **interactive gameplay** (browser games, cloud gaming sites). It does **NOT** include videos about games (reviews, news, walkthroughs).
+       - **"Entertainment":** Refers to **passive watching**. This INCLUDES gameplay videos (Let's Plays), streams, movies, and viral clips.
+       - **"Shopping":** Refers ONLY to **transactional pages** (storefronts, checkout). It does **NOT** include product reviews or unboxings.
     4. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
@@ -190,33 +176,31 @@ app.post('/check-url', async (req, res) => {
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // 1. Infrastructure (SILENT ALLOW)
+        // 1. Infrastructure (Hidden)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (SILENT ALLOW)
+        // 2. Search Engines (Logged)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
-             // We still construct the title for our own console logs, but the event won't be saved to DB
              let engine = "Search Engine";
              if (hostname.includes('google')) engine = "Google";
              else if (hostname.includes('bing')) engine = "Bing";
              const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             console.log(`System Allow: ${displayTitle}`);
-
+             
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (SILENT ALLOW)
+        // 3. YouTube Browsing (Logged)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
-                 console.log(`System Allow: ${displayTitle}`);
                  
+                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Navigation";
+
                  await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
                  return res.json({ decision: 'ALLOW' });
             }
@@ -224,7 +208,7 @@ app.post('/check-url', async (req, res) => {
         
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
@@ -233,7 +217,7 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check (The only place we show Search Query in logs)
+        // 5. AI Check
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
