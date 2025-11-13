@@ -25,11 +25,11 @@ app.use(express.json());
 
 // --- 1. INFRASTRUCTURE ALLOW LIST ---
 const SYSTEM_ALLOWED_DOMAINS = [
-    'onrender.com',       // Allows your backend and frontend
-    'supabase.co',        // Allows Supabase API calls
-    'accounts.google.com',// Allows the Google Sign-In flow
-    'beaconblocker.com',  // Your custom domain
-    'vercel.app'          // Dashboard hosting
+    'onrender.com',       
+    'supabase.co',        
+    'accounts.google.com',
+    'beaconblocker.com',
+    'vercel.app'          
 ];
 
 // --- Helper: getDomainFromUrl ---
@@ -55,15 +55,10 @@ function getDomainFromUrl(urlString) {
 // --- Helper: Log Blocking Event ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
+    if (!userId) return; 
     
-    if (!userId) {
-        console.log("⚠️ Skipping log: No User ID found.");
-        return; 
-    }
-    
-    // --- THE FIX IS HERE ---
-    // Only skip strictly internal system rules (like the dashboard itself).
-    // We WANT to log search engines and YouTube browsing.
+    // --- THE FIX: Only skip INFRASTRUCTURE logs ---
+    // We want to see "Search Allowed" and "YouTube Navigation"
     if (reason && reason.startsWith('System Rule (Infra)')) {
         return; 
     }
@@ -78,17 +73,15 @@ async function logBlockingEvent(logData) {
             reason: reason,
             page_title: pageTitle || ''
         });
-        if (error) console.error("❌ Database Error logging event:", error.message);
-        else console.log(`✅ Logged event: ${decision} - ${reason}`);
+        if (error) console.error("Error logging event:", error.message);
     } catch (err) {
         console.error("Exception during logging:", err.message);
     }
 }
 
-// --- Database Function: Fetches User Rule ---
+// --- Database Function ---
 async function getUserRuleData(apiKey) {
     if (!apiKey) return null;
-    
     const { data, error } = await supabase
         .from('rules')
         .select('user_id, prompt, api_key, blocked_categories, allow_list, block_list, last_seen')
@@ -99,7 +92,6 @@ async function getUserRuleData(apiKey) {
         console.error("Error fetching rule:", error?.message);
         return null;
     }
-
     data.allow_list = data.allow_list || [];
     data.block_list = data.block_list || [];
     data.blocked_categories = data.blocked_categories || {};
@@ -111,7 +103,7 @@ async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
-    console.log(`AI Input: Title='${title}', URL='${url}'`);
+    console.log(`AI Check: Title='${title}', URL='${url}'`);
 
     let finalPrompt = userMainPrompt || "No prompt provided."; 
     const BLOCKED_CATEGORY_LABELS = {
@@ -127,10 +119,10 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    finalPrompt += `\n\nAnalyze the webpage based on the following information:
+    finalPrompt += `\n\nAnalyze the webpage based on:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
-    - H1 Header: "${h1 || 'N/A'}"
+    - H1: "${h1 || 'N/A'}"
     - Description: "${description || 'N/A'}"
     - Keywords: "${keywords || 'N/A'}" 
     - Body Snippet: "${bodyText || 'N/A'}" 
@@ -138,8 +130,8 @@ async function getAIDecision(pageData, ruleData) {
 
     My user's rule details are above.
     **CRITICAL INSTRUCTIONS (In Order of Priority):**
-    1. **User's Main Prompt:** This is the highest priority. If the user explicitly allows a specific site or topic (e.g., "Allow YouTube", "Allow Twitter"), you MUST ALLOW it, even if it fits a blocked category.
-    2. **Blocked Categories:** If the page fits a blocked category and is NOT exempted by the Main Prompt, BLOCK it.
+    1. **User's Main Prompt:** Highest priority. If the user explicitly allows a topic (e.g. "Allow YouTube"), ALLOW it.
+    2. **Blocked Categories:** If the page fits a blocked category and is NOT exempted, BLOCK it.
     3. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
@@ -147,15 +139,11 @@ async function getAIDecision(pageData, ruleData) {
         const result = await model.generateContent(finalPrompt);
         const response = await result.response;
         let decision = response.text().trim().toUpperCase();
-        
-        if (decision.includes('BLOCK')) decision = 'BLOCK';
-        else if (decision.includes('ALLOW')) decision = 'ALLOW';
-        else decision = 'BLOCK'; 
-        
-        console.log(`AI Output: ${decision}`);
-        return decision;
+        if (decision.includes('BLOCK')) return 'BLOCK';
+        if (decision.includes('ALLOW')) return 'ALLOW';
+        return 'BLOCK'; 
     } catch (error) {
-        console.error('AI Error:', error.message);
+        console.error('Error contacting AI:', error.message);
         return 'BLOCK';
     }
 }
@@ -167,38 +155,34 @@ app.post('/check-url', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const apiKey = authHeader ? authHeader.split(' ')[1] : null;
 
-    if (!url || !apiKey) {
-        return res.status(400).json({ error: 'Missing URL or API Key' });
-    }
+    if (!url || !apiKey) return res.status(400).json({ error: 'Missing URL or API Key' });
 
     let userId = null;
 
     try {
-        // Fetch rules FIRST to get userId for logging
-        const ruleData = await getUserRuleData(apiKey);
-        if (!ruleData) return res.status(401).json({ error: "Invalid API Key" });
-        
-        userId = ruleData.user_id;
-        const { allow_list, block_list } = ruleData;
-        
+        // --- 1. SMART ALLOWS (Save Tokens) ---
         const urlObj = new URL(url);
         const hostname = urlObj.hostname.toLowerCase();
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // --- 1. SYSTEM ALLOWS (Infra - Hidden from Logs) ---
+        // A. Infrastructure (Log as Infra -> Skipped by logger)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              console.log(`System Allow: Infra (${baseDomain})`);
-             // Log as "System Rule (Infra)" so it's SKIPPED by the helper
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 2. SEARCH ENGINE ALLOWS (Logged!) ---
+        // 2. Fetch User Rules (Need userId for logging below)
+        const ruleData = await getUserRuleData(apiKey);
+        if (!ruleData) return res.status(401).json({ error: "Invalid API Key" });
+        userId = ruleData.user_id;
+        const { allow_list, block_list } = ruleData;
+
+        // B. Search Engines (Now using clean names!)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
-             // Detect Engine Name
              let engine = "Search Engine";
              if (hostname.includes('google')) engine = "Google";
              else if (hostname.includes('bing')) engine = "Bing";
@@ -207,7 +191,6 @@ app.post('/check-url', async (req, res) => {
              const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
              console.log(`System Allow: ${displayTitle}`);
              
-             // Log with a CLEAN reason
              await logBlockingEvent({
                  userId, 
                  url, 
@@ -218,14 +201,13 @@ app.post('/check-url', async (req, res) => {
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 3. YOUTUBE BROWSING ALLOWS (Logged!) ---
+        // C. YouTube Browsing (Now using clean names!)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
                  
                  const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
                  console.log(`System Allow: ${displayTitle}`);
 
-                 // Log with a CLEAN reason
                  await logBlockingEvent({
                      userId, 
                      url, 
@@ -236,28 +218,28 @@ app.post('/check-url', async (req, res) => {
                  return res.json({ decision: 'ALLOW' });
             }
         }
-
-        // --- 4. User Lists ---
+        
+        // --- 3. User Lists ---
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Allow: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Block: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // --- 5. AI Check ---
-        console.log("Proceeding to AI Check...");
+        // --- 4. AI Check ---
+        console.log("AI Check for:", url);
         const decision = await getAIDecision(pageData, ruleData);
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
         res.json({ decision: decision });
 
     } catch (err) {
-        console.error("Server Error:", err.message);
+        console.error("Error in check-url:", err.message);
         await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Server Error', pageTitle: pageData?.title});
         res.status(500).json({ error: "Internal Server Error" });
     }
