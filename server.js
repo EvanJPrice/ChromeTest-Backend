@@ -1,3 +1,6 @@
+// FILE: server.js
+// VERSION: v4.1 (Explicit Log Suppression for Search/Nav)
+
 // --- Imports ---
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -17,7 +20,6 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-// Set Temperature to 0 for consistency
 const model = genAI.getGenerativeModel({ 
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -52,12 +54,21 @@ function getDomainFromUrl(urlString) {
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
+// --- Helper: Log Blocking Event (UPDATED SUPPRESSION) ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
-    
-    // Only skip strictly internal infrastructure logs
-    if (reason && reason.startsWith('System Rule (Infra)')) return; 
+
+    // --- THE FIX: Explicitly skip Search and Navigation logs ---
+    // We want to keep the feed clean for the user.
+    // We skip if it's an internal system rule, a search engine, or YouTube navigation.
+    if (reason === 'System Rule (Infra)' || 
+        reason === 'Search Allowed' || 
+        reason === 'YouTube Navigation') {
+        
+        // console.log(`Skipping log for: ${reason}`); // Optional debug
+        return; 
+    }
 
     try {
         const domain = getDomainFromUrl(url);
@@ -88,7 +99,7 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (With Context Nuance) ---
+// --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
@@ -109,7 +120,6 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    // --- HERE IS THE FIX FOR LETTERBOXD ---
     finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -119,14 +129,10 @@ async function getAIDecision(pageData, ruleData) {
     - Search Query (Context): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
-    **CRITICAL INSTRUCTIONS:**
-    1. **User's Main Prompt:** Highest priority. If they say "Allow YouTube", accept it regardless of category.
-    2. **Context Nuance (The "Productivity" Filter):**
-       - **"Games":** Blocks *playing* games. **ALLOW** tech news, hardware reviews (e.g. "Steam Deck", "VR Headset"), wikis, and industry analysis.
-       - **"Shopping":** Blocks *stores* (checkout/product pages). **ALLOW** product reviews, "First Look" videos, and unboxings.
-       - **"Entertainment":** Blocks *streaming* (Netflix, Hulu) and *mindless watching*. **ALLOW** databases (IMDb, Letterboxd), written reviews, wikipedia-style info, and educational analysis.
-       - **"Social Media":** Blocks *feeds* (scrolling). **ALLOW** specific pages if they are informational (e.g. a specific post linked from news).
-    3. **Search Match:** If the user searched for a topic and clicked a matching result, weight this as **Productive Intent**.
+    **CRITICAL INSTRUCTIONS (In Order of Priority):**
+    1. **User's Main Prompt:** Highest priority. If the user explicitly allows a specific topic/site, ALLOW it.
+    2. **Blocked Categories:** If the page fits a blocked category (and is NOT exempted by the Prompt), BLOCK it.
+    3. **Search Context:** If the Search Query strongly matches the page content, treat this as productive intent (lean ALLOW).
     4. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
@@ -165,32 +171,33 @@ app.post('/check-url', async (req, res) => {
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // 1. Infrastructure
+        // 1. Infrastructure (SILENT ALLOW)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (Logged)
+        // 2. Search Engines (SILENT ALLOW)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
+             // We still construct the title for our own console logs, but the event won't be saved to DB
              let engine = "Search Engine";
              if (hostname.includes('google')) engine = "Google";
              else if (hostname.includes('bing')) engine = "Bing";
-
              const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             
+             console.log(`System Allow: ${displayTitle}`);
+
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (Logged)
+        // 3. YouTube Browsing (SILENT ALLOW)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
+                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
+                 console.log(`System Allow: ${displayTitle}`);
                  
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Navigation";
-
                  await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
                  return res.json({ decision: 'ALLOW' });
             }
@@ -198,16 +205,16 @@ app.post('/check-url', async (req, res) => {
         
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check
+        // 5. AI Check (The only place we show Search Query in logs)
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
