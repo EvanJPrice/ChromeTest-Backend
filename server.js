@@ -17,7 +17,11 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+// Set Temperature to 0 for consistency
+const model = genAI.getGenerativeModel({ 
+    model: "gemini-flash-latest",
+    generationConfig: { temperature: 0.0 }
+});
 const app = express();
 const port = process.env.PORT || 3000;
 app.use(cors());
@@ -51,7 +55,7 @@ function getDomainFromUrl(urlString) {
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
-    if (reason && reason.startsWith('System Rule (Infra)')) return; 
+    if (reason && reason.startsWith('System Rule')) return; 
 
     try {
         const domain = getDomainFromUrl(url);
@@ -82,11 +86,12 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
+// --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
-    console.log(`AI Input: Title='${title}', URL='${url}'`);
+    console.log(`AI Input: Title='${title}'`);
 
     let finalPrompt = userMainPrompt || "No prompt provided."; 
     const BLOCKED_CATEGORY_LABELS = {
@@ -102,20 +107,23 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    finalPrompt += `\n\nAnalyze the webpage based on:
+    // --- REFINED PROMPT INSTRUCTIONS ---
+    finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
     - H1: "${h1 || 'N/A'}"
     - Description: "${description || 'N/A'}"
     - Keywords: "${keywords || 'N/A'}" 
     - Body Snippet: "${bodyText || 'N/A'}" 
-    - Search Query (context): "${searchQuery || 'N/A'}"
+    - Search Query (Context): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
     **CRITICAL INSTRUCTIONS:**
-    1. **User's Main Prompt:** Highest priority.
-    2. **Blocked Categories:** If page fits a category and is NOT exempted by Main Prompt, BLOCK it.
-    3. **General:** Respond with *only* ALLOW or BLOCK.
+    1. **User's Main Prompt:** This overrides everything. If they say "Allow YouTube", allow it.
+    2. **Search Context:** If the Search Query matches the content (e.g. search "VR Headset" -> video "VR Headset Review"), weight this heavily as INTENTIONAL and PRODUCTIVE.
+    3. **Nuance on Categories:** - "Games" category means *playing* games. DO NOT block tech news, reviews, or industry analysis just because they mention games (like Steam).
+       - "Shopping" category means *e-commerce stores*. DO NOT block product reviews or "first look" videos.
+    4. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
     try {
@@ -131,6 +139,7 @@ async function getAIDecision(pageData, ruleData) {
     }
 }
 
+// --- API Endpoint: Check URL ---
 app.post('/check-url', async (req, res) => {
     const pageData = req.body;
     const url = pageData?.url;
@@ -152,38 +161,30 @@ app.post('/check-url', async (req, res) => {
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
+        // 1. Infrastructure (Hidden)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- SEARCH ENGINES ---
+        // 2. Search Engines (Hidden)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
-             
-             let engine = "Search Engine";
-             if (hostname.includes('google')) engine = "Google";
-             else if (hostname.includes('bing')) engine = "Bing";
-
-             // Use the search query from pageData
-             const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             
-             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
+             // SILENT ALLOW - No Log
+             console.log("System Allow: Search Engine (Silent)");
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- YOUTUBE BROWSING ---
+        // 3. YouTube Browsing (Hidden)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                 
-                 // Use the search query if present
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : (pageData.title || "YouTube Browsing");
-
-                 await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
+                 // SILENT ALLOW - No Log
+                 console.log("System Allow: YouTube Browsing (Silent)");
                  return res.json({ decision: 'ALLOW' });
             }
         }
         
+        // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
@@ -194,12 +195,12 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'BLOCK' });
         }
 
+        // 5. AI Check (With "Search:" label)
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
-        // Log with Search Context if available
         let logTitle = pageData?.title || "Unknown Page";
-        if (pageData.searchQuery) logTitle += ` [Context: '${pageData.searchQuery}']`;
+        if (pageData.searchQuery) logTitle += ` [Search: '${pageData.searchQuery}']`; // CHANGED LABEL
 
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: logTitle});
         res.json({ decision: decision });
@@ -211,6 +212,7 @@ app.post('/check-url', async (req, res) => {
     }
 });
 
+// --- Heartbeat ---
 app.post('/heartbeat', async (req, res) => {
     const apiKey = req.query.key;
     if (apiKey) {
